@@ -34,12 +34,20 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
+      /*
+      内核栈的初始化原来是在 kernel/proc.c 中的 procinit 函数内，
+      这部分要求将函数内的代码转移到 allocproc 函数内，
+      因此在上一步初始化内核态页表的代码下面接着添加初始化内核栈的代码：
+      */
+      /*
+      这段代码要转移
       char *pa = kalloc();
       if(pa == 0)
         panic("kalloc");
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
+      */
   }
   kvminithart();
 }
@@ -120,6 +128,22 @@ found:
     release(&p->lock);
     return 0;
   }
+  // 第三步，初始化内核栈
+  // 下面是新添加的
+  // An empty user kernel page table.
+  p->kpagetable = ukvminit();
+  if(p->kpagetable == 0) {
+    freeproc(p);
+	release(&p->lock);
+	return 0;
+  }
+
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)(p - proc));
+  ukvmmap(p->kpagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -139,9 +163,30 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  /*
+  第五步，释放内核栈内存
+  释放页表的第一步是先释放页表内的内核栈，
+  因为页表内存储的内核栈地址本身就是一个虚拟地址，
+  需要先将这个地址指向的物理地址进行释放：
+  */
+  // delete kstack
+  if(p->kstack) {
+    pte_t* pte = walk(p->kpagetable, p->kstack, 0);
+	if(pte == 0)
+      panic("freeproc: walk");
+	kfree((void*)PTE2PA(*pte));
+  }
+  p->kstack = 0;
+  // delete user pagetable
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  // 第六步，释放内核页表
+  // delete kernel pagetable
+  if(p->kpagetable) {
+    proc_freewalk(p->kpagetable);
+  }
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -150,6 +195,27 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+}
+// 第六步，释放内核页表
+/*
+然后是释放页表，直接遍历所有的页表，释放所有有效的页表项即可。
+仿照 freewalk 函数。由于 freewalk 函数将对应的物理地址也直接释放了，
+我们这里释放的内核页表仅仅只是用户进程的一个备份，
+释放时仅释放页表的映射关系即可，不能将真实的物理地址也释放了。
+因此不能直接调用freewalk 函数，而是需要进行更改：
+*/
+void proc_freewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+	if (pte & PTE_V) {
+	  pagetable[i] = 0;
+	  if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+	    uint64 child = PTE2PA(pte);
+		proc_freewalk((pagetable_t)child);
+	  }
+	}
+  }
+  kfree((void*)pagetable);
 }
 
 // Create a user page table for a given process,
@@ -221,6 +287,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  u2kvmcopy(p->pagetable, p->kpagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,9 +311,11 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+	if(PGROUNDUP(sz + n) >= PLIC) return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+	u2kvmcopy(p->pagetable, p->kpagetable, sz - n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -288,6 +358,8 @@ fork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
+  // 复制页表项的方法 将用户进程页表的所有内容都复制到内核页表中
+  u2kvmcopy(np->pagetable, np->kpagetable, 0, np->sz);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -473,7 +545,21 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-        swtch(&c->context, &p->context);
+		/*
+    第四步，进程调度时，切换内核页
+    内核页的管理使用的是 SATP 寄存器，
+    在 kernel/proc.c 的调度函数 scheduler 中添加切换 SATP 寄存器的代码，
+    并在调度后切换回来：
+    */
+        // change satp
+		  w_satp(MAKE_SATP(p->kpagetable));
+		  sfence_vma();
+
+		// change process
+      swtch(&c->context, &p->context);
+
+        // change back
+	    kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
@@ -486,6 +572,8 @@ scheduler(void)
 #if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
+	  // change satp
+	  // kvminithart();
       asm volatile("wfi");
     }
 #else
